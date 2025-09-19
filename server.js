@@ -52,10 +52,20 @@ const db = new sqlite3.Database(dbPath, (err) => {
         author TEXT NOT NULL,
         date TEXT NOT NULL,
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        category TEXT
       )`, (err) => {
         if (err) console.error('Error creating posts table:', err);
         else console.log('Posts table ready');
+      });
+
+      // New blog_categories table
+      db.run(`CREATE TABLE IF NOT EXISTS blog_categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL
+      )`, (err) => {
+        if (err) console.error('Error creating blog_categories table:', err);
+        else console.log('Blog categories table ready');
       });
       
     db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -88,6 +98,18 @@ const db = new sqlite3.Database(dbPath, (err) => {
       )`, (err) => {
         if (err) console.error('Error creating blog_access table:', err);
         else console.log('Blog access table ready');
+      });
+
+      // Add category column to posts table if it doesn't exist
+      db.all(`PRAGMA table_info(posts)`, [], (err, columns) => {
+        if (err) { console.error('Error checking posts table info:', err); return; }
+        const hasCategory = columns.some(col => col.name === 'category');
+        if (!hasCategory) {
+          db.run(`ALTER TABLE posts ADD COLUMN category TEXT`, (alterErr) => {
+            if (alterErr) console.error('Error adding category column:', alterErr);
+            else console.log('✅ Added category column to posts table');
+          });
+        }
       });
 
       // Add canManageAllBlogs column if it doesn't exist
@@ -356,11 +378,111 @@ app.get('/blog-access', (req, res) => {
   });
 });
 
+
+// New API: Get blog stats
+app.get('/blog-stats', (req, res) => {
+  db.all(`
+    SELECT
+      (SELECT COUNT(*) FROM posts) AS totalBlogs,
+      (SELECT COUNT(*) FROM users WHERE role = 'admin') AS totalAdmins
+  `, [], (err, stats) => {
+    if (err) {
+      console.error('Error fetching blog stats:', err);
+      return res.status(500).json({ error: err.message });
+    }
+
+    db.all(`
+      SELECT category, COUNT(*) AS count FROM posts GROUP BY category
+    `, [], (err, categories) => {
+      if (err) {
+        console.error('Error fetching category counts:', err);
+        return res.status(500).json({ error: err.message });
+      }
+
+      db.all(`
+        SELECT author, COUNT(*) AS count FROM posts WHERE author IN (SELECT email FROM users WHERE role = 'admin') GROUP BY author
+      `, [], (err, admins) => {
+        if (err) {
+          console.error('Error fetching admin post counts:', err);
+          return res.status(500).json({ error: err.message });
+        }
+
+        res.json({
+          totalBlogs: stats[0].totalBlogs,
+          totalAdmins: stats[0].totalAdmins,
+          categories,
+          admins
+        });
+      });
+    });
+  });
+});
+
+
+// New API: Get all blog categories
+app.get('/blog-categories', (req, res) => {
+  db.all(`SELECT * FROM blog_categories ORDER BY name ASC`, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching categories:', err);
+      return res.status(500).json({ error: err.message });
+    }
+    res.json(rows);
+  });
+});
+
+
+// New API: Create a new blog category (superadmin only)
+app.post('/blog-categories', (req, res) => {
+  const { name, requesterRole } = req.body;
+
+  if (requesterRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Unauthorized: Only superadmins can create categories' });
+  }
+
+  if (!name) {
+    return res.status(400).json({ error: 'Category name is required' });
+  }
+
+  db.run(`INSERT INTO blog_categories (name) VALUES (?)`, [name], function (err) {
+    if (err) {
+      if (err.message.includes('UNIQUE constraint failed')) {
+        return res.status(409).json({ error: 'Category with this name already exists' });
+      }
+      console.error('Error creating category:', err);
+      return res.status(500).json({ error: err.message });
+    }
+    res.status(201).json({ id: this.lastID, name: name });
+  });
+});
+
+
+// New API: Delete a blog category (superadmin only)
+app.delete('/blog-categories/:id', (req, res) => {
+  const { id } = req.params;
+  const { requesterRole } = req.body;
+
+  if (requesterRole !== 'superadmin') {
+    return res.status(403).json({ error: 'Unauthorized: Only superadmins can delete categories' });
+  }
+
+  db.run(`DELETE FROM blog_categories WHERE id = ?`, [id], function (err) {
+    if (err) {
+      console.error('Error deleting category:', err);
+      return res.status(500).json({ error: err.message });
+    }
+    if (this.changes === 0) {
+      return res.status(404).json({ message: 'Category not found' });
+    }
+    res.json({ message: 'Category deleted successfully' });
+  });
+});
+
+
 // ========== POSTS ROUTES (Updated with access control) ==========
 
 // Create a new post
 app.post('/posts', (req, res) => {
-  const { id, title, subHeading, content, author, date, requesterRole } = req.body;
+  const { id, title, subHeading, content, author, date, requesterRole, category } = req.body;
   
   if (!['admin', 'superadmin'].includes(requesterRole)) {
     return res.status(403).json({ error: 'Unauthorized: Only admins and superadmins can create posts' });
@@ -370,9 +492,23 @@ app.post('/posts', (req, res) => {
     return res.status(400).json({ error: 'Missing required fields: id, title, content, author, date' });
   }
 
+  // Validate category
+  if (category) {
+    db.get(`SELECT name FROM blog_categories WHERE name = ?`, [category], (err, row) => {
+      if (err || !row) {
+        return res.status(400).json({ error: 'Invalid blog category selected' });
+      }
+      insertPost(id, title, subHeading, content, author, date, category, res);
+    });
+  } else {
+    insertPost(id, title, subHeading, content, author, date, null, res);
+  }
+});
+
+function insertPost(id, title, subHeading, content, author, date, category, res) {
   db.run(
-    `INSERT INTO posts (id, title, subHeading, content, author, date) VALUES (?, ?, ?, ?, ?, ?)`,
-    [id, title, subHeading || '', content, author, date],
+    `INSERT INTO posts (id, title, subHeading, content, author, date, category) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, title, subHeading || '', content, author, date, category],
     function (err) {
       if (err) {
         console.error('Error creating post:', err);
@@ -386,7 +522,8 @@ app.post('/posts', (req, res) => {
       });
     }
   );
-});
+}
+
 
 // Get all posts
 app.get('/posts', (req, res) => {
@@ -420,7 +557,7 @@ app.get('/posts/:id', (req, res) => {
 // Update post (Enhanced with granular access control)
 app.put('/posts/:id', (req, res) => {
   const { id } = req.params;
-  const { title, subHeading, content, author, date, requesterRole, requesterUid } = req.body;
+  const { title, subHeading, content, author, date, requesterRole, requesterUid, category } = req.body;
 
   if (!['admin', 'superadmin'].includes(requesterRole)) {
     return res.status(403).json({ error: 'Unauthorized: Only admins and superadmins can edit posts' });
@@ -433,8 +570,8 @@ app.put('/posts/:id', (req, res) => {
   // For superadmin, directly update
   if (requesterRole === 'superadmin') {
     db.run(
-      `UPDATE posts SET title = ?, subHeading = ?, content = ?, author = ?, date = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
-      [title, subHeading || '', content, author, date, id],
+      `UPDATE posts SET title = ?, subHeading = ?, content = ?, author = ?, date = ?, category = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
+      [title, subHeading || '', content, author, date, category || null, id],
       function (err) {
         if (err) {
           console.error('Error updating post:', err);
@@ -471,8 +608,8 @@ app.put('/posts/:id', (req, res) => {
           
           // Admin is the author, allow update
   db.run(
-            `UPDATE posts SET title = ?, subHeading = ?, content = ?, author = ?, date = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
-            [title, subHeading || '', content, author, date, id],
+            `UPDATE posts SET title = ?, subHeading = ?, content = ?, author = ?, date = ?, category = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
+            [title, subHeading || '', content, author, date, category || null, id],
     function (err) {
               if (err) {
                 console.error('Error updating post:', err);
@@ -486,8 +623,8 @@ app.put('/posts/:id', (req, res) => {
       } else {
         // Admin has access, allow update
         db.run(
-          `UPDATE posts SET title = ?, subHeading = ?, content = ?, author = ?, date = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
-          [title, subHeading || '', content, author, date, id],
+          `UPDATE posts SET title = ?, subHeading = ?, content = ?, author = ?, date = ?, category = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
+          [title, subHeading || '', content, author, date, category || null, id],
           function (err) {
             if (err) {
               console.error('Error updating post:', err);
